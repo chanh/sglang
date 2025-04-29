@@ -1891,14 +1891,20 @@ class Scheduler(
             return
 
         logger.info("Stop profiling...")
+        print("111")
         if self.torch_profiler is not None:
+            print("444")
             self.torch_profiler.stop()
+            print("5555")
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.torch_profiler_output_dir,
                     self.profiler_id + f"-TP-{self.tp_rank}" + ".trace.json.gz",
                 )
             )
+            print("6666")
+
+        print("2222")
 
         if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -1907,9 +1913,11 @@ class Scheduler(
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
+        print("333")
 
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
+        print("4444")
 
         logger.info(
             "Profiling done. Traces are saved to: %s",

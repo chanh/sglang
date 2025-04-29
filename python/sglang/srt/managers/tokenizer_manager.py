@@ -41,6 +41,7 @@ from typing import (
 )
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -178,6 +179,7 @@ class TokenizerManager:
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
 
+        self.mm_stream = None
         if self.model_config.is_multimodal:
             import_processors()
             _processor = get_processor(
@@ -194,6 +196,8 @@ class TokenizerManager:
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor
             )
+
+            self.mm_stream = torch.cuda.Stream()
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -423,6 +427,7 @@ class TokenizerManager:
             input_text=input_text or input_ids,
             request_obj=obj,
             max_req_input_len=self.max_req_input_len,
+            stream=self.mm_stream,
         )
         if image_inputs and "input_ids" in image_inputs:
             input_ids = image_inputs["input_ids"]

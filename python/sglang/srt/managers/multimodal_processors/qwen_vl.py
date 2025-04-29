@@ -1,4 +1,3 @@
-import asyncio
 import math
 from typing import List, Union
 
@@ -42,6 +41,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         input_text,
         request_obj,
         max_req_input_len,
+        stream,
         *args,
         **kwargs,
     ):
@@ -49,7 +49,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
@@ -114,18 +114,15 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
             return math.floor(number / factor) * factor
 
-        async def resize_image_async(image):
-            return resize_image(image)
-
         if base_output.images:
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
+            base_output.images = [resize_image(image) for image in base_output.images]
 
-        ret = self.process_mm_data(
-            input_text=base_output.input_text,
-            images=base_output.images,
-        )
-
+        with torch.cuda.stream(stream):
+            ret = self.process_mm_data(
+                input_text=base_output.input_text,
+                images=base_output.images,
+            )
+        stream.synchronize()
         items = []
 
         input_ids = ret["input_ids"].flatten().tolist()

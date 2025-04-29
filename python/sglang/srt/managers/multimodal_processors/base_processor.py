@@ -204,7 +204,7 @@ class BaseMultimodalProcessor(ABC):
 
         return futures, task_info
 
-    def load_mm_data(
+    async def load_mm_data(
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
