@@ -72,6 +72,7 @@ class TestVLMModels(CustomTestCase):
         model_version: str,
         chat_template: str,
         batch_size: int,
+        limit: str,
         output_path: str,
         *,
         env: dict | None = None,
@@ -113,6 +114,8 @@ class TestVLMModels(CustomTestCase):
             log_suffix,
             "--output_path",
             str(output_path),
+            "--limit",
+            str(limit),
         ]
 
         subprocess.run(
@@ -140,8 +143,6 @@ class TestVLMModels(CustomTestCase):
                     base_url=self.base_url,
                     timeout=self.time_out,
                     other_args=[
-                        "--chat-template",
-                        model.chat_template,
                         "--trust-remote-code",
                         "--enable-multimodal",
                         "--mem-fraction-static",
@@ -162,7 +163,8 @@ class TestVLMModels(CustomTestCase):
                     model.model,
                     model.chat_template,
                     self.parsed_args.batch_size,
-                    "./logs",
+                    limit=str(0 if self.parsed_args.profile else -1),
+                    output_path="./logs",
                 )
 
                 if args.profile:
@@ -188,7 +190,7 @@ class TestVLMModels(CustomTestCase):
                 print(f"Evaluation time:", result["total_evaluation_time_seconds"])
                 results[model.model] = {
                     "accu": mmmu_accuracy,
-                    "time": result["total_evaluation_time_seconds"]
+                    "time": result["total_evaluation_time_seconds"],
                 }
                 # Assert performance meets expected threshold
                 self.assertGreaterEqual(
@@ -231,7 +233,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-             "SGLANG_TORCH_PROFILER_DIR to enable profiler",
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler",
         default=False,
     )
 
@@ -239,7 +241,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.profile:
-        log_level = os.getenv('LOG_LEVEL', 'WARNING').upper()
+        log_level = os.getenv("LOG_LEVEL", "WARNING").upper()
         logging.basicConfig(level="INFO")
 
     # Store the parsed args object on the class
