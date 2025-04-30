@@ -62,6 +62,9 @@ class PrefillMetadata:
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
+# Use as a fast path to override the indptr in flashinfer's plan function
+# This is used to remove some host-to-device copy overhead.
+global_override_indptr_cpu = None
 
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
@@ -648,6 +651,8 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        global global_override_indptr_cpu
+
         if spec_info is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -670,9 +675,13 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+
+            if global_override_indptr_cpu is None:
+                global_override_indptr_cpu = kv_indptr.cpu()
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
+            global_override_indptr_cpu = kv_indptr  # Already assumed to be on CPU
 
         wrapper.begin_forward(
             kv_indptr,
@@ -686,6 +695,7 @@ class FlashInferIndicesUpdaterDecode:
             q_data_type=self.q_data_type,
             non_blocking=True,
         )
+
 
 
 class FlashInferIndicesUpdaterPrefill:
@@ -924,10 +934,6 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
 
-# Use as a fast path to override the indptr in flashinfer's plan function
-# This is used to remove some host-to-device copy overhead.
-global global_override_indptr_cpu
-
 
 class FlashInferMultiStepDraftBackend:
     """
@@ -1008,10 +1014,13 @@ class FlashInferMultiStepDraftBackend:
         assert forward_batch.spec_info is not None
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
 
-        # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
-        global global_override_indptr_cpu
+        # Copy the kv_indptr slices once to avoid multiple device-to-host copies in flashinfer's plan.
+        indptr_cpu_whole = [
+            self.kv_indptr[i, :bs + 1].cpu()
+            for i in range(self.speculative_num_steps - 1)
+        ]
 
+        global global_override_indptr_cpu
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
@@ -1135,10 +1144,6 @@ def should_use_tensor_core(
         return False
 
 
-# Use as a fast path to override the indptr in flashinfer's plan function
-# This is used to remove some host-to-device copy overhead.
-global_override_indptr_cpu = None
-
 
 def fast_decode_plan(
     self,
@@ -1160,6 +1165,7 @@ def fast_decode_plan(
     rope_theta: Optional[float] = None,
     non_blocking: bool = True,
 ) -> None:
+    global global_override_indptr_cpu
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
     Modifications:
