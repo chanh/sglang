@@ -47,7 +47,8 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -190,10 +191,18 @@ class TokenizerManager:
         self.last_tokenization_rate_print = time.time()
         self.tokenization_rate_lock = threading.Lock()
 
-        # Add thread pool for parallel tokenization
-        self.tokenizer_thread_pool = ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_TOKENIZER_WORKERS", os.cpu_count()))
+        # Add process pool for parallel tokenization
+        self.tokenizer_process_pool = ProcessPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_TOKENIZER_WORKERS", os.cpu_count())),
+            mp_context=multiprocessing.get_context('spawn')  # Use spawn for better compatibility
         )
+
+        # Store tokenizer in a way that can be pickled for process pool
+        self._tokenizer_path = server_args.tokenizer_path
+        self._tokenizer_mode = server_args.tokenizer_mode
+        self._trust_remote_code = server_args.trust_remote_code
+        self._revision = server_args.revision
+        self._tokenizer = None  # Will be initialized in each worker process
 
         # Add profiler
         self.torch_profiler = None
@@ -651,21 +660,29 @@ class TokenizerManager:
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
 
-        # Batch tokenize all texts
-        encoded = self.tokenizer(texts)
+        # Batch tokenize all texts in the main process since we need the tokenizer
+        tokenizer = self._get_tokenizer()
+        encoded = tokenizer(texts)
         input_ids_list = encoded["input_ids"]
 
-        # Process all requests in parallel using thread pool
+        # Process all requests in parallel using process pool
         def process_request(i):
+            # Each worker process needs its own tokenizer
+            tokenizer = get_tokenizer(
+                self._tokenizer_path,
+                tokenizer_mode=self._tokenizer_mode,
+                trust_remote_code=self._trust_remote_code,
+                revision=self._revision,
+            )
             req = requests[i]
             self._validate_token_len(obj[i], input_ids_list[i])
             return self._create_tokenized_object(
                 req, req.text, input_ids_list[i], None, None
             )
 
-        # Use thread pool to parallelize request processing
+        # Use process pool to parallelize request processing
         futures = [
-            self.tokenizer_thread_pool.submit(process_request, i)
+            self.tokenizer_process_pool.submit(process_request, i)
             for i in range(batch_size)
         ]
         tokenized_objs = [f.result() for f in futures]
@@ -785,7 +802,7 @@ class TokenizerManager:
                 # Parallel tokenization for individual requests
                 objs = [obj[i] for i in range(batch_size)]
                 futures = [
-                    self.tokenizer_thread_pool.submit(self._tokenize_one_request, tmp_obj)
+                    self.tokenizer_process_pool.submit(self._tokenize_one_request, tmp_obj)
                     for tmp_obj in objs
                 ]
                 tokenized_objs = await asyncio.gather(
@@ -1526,9 +1543,9 @@ class TokenizerManager:
                 self.model_update_result.set_result(self.model_update_tmp)
 
     def __del__(self):
-        """Cleanup thread pool on deletion."""
-        if hasattr(self, 'tokenizer_thread_pool'):
-            self.tokenizer_thread_pool.shutdown(wait=True)
+        """Cleanup process pool on deletion."""
+        if hasattr(self, 'tokenizer_process_pool'):
+            self.tokenizer_process_pool.shutdown(wait=True)
 
 
 async def print_exception_wrapper(func):
