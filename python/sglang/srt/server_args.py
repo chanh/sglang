@@ -80,6 +80,8 @@ class ServerArgs:
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
+    min_batch_size: int = 1  # Minimum number of requests to wait for before processing a batch
+    max_batch_wait_ms: int = 0  # Maximum time in milliseconds to wait for more requests to reach min_batch_size
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -714,6 +716,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
+        )
+        parser.add_argument(
+            "--min-batch-size",
+            type=int,
+            default=ServerArgs.min_batch_size,
+            help="Minimum number of requests to wait for before processing a batch. Set to 1 to disable minimum batch size.",
+        )
+        parser.add_argument(
+            "--max-batch-wait-ms",
+            type=int,
+            default=ServerArgs.max_batch_wait_ms,
+            help="Maximum time in milliseconds to wait for more requests to reach min_batch_size. Set to 0 to disable waiting.",
         )
         parser.add_argument(
             "--stream-interval",

@@ -459,6 +459,10 @@ class Scheduler(
         )
         self.init_disaggregation()
 
+        self.min_batch_size = server_args.min_batch_size
+        self.max_batch_wait_ms = server_args.max_batch_wait_ms
+        self.last_batch_time = time.perf_counter()
+
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -1340,6 +1344,35 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
+        
+        # Check if we should wait for more requests based on minimum batch size
+        current_time = time.perf_counter()
+        if (self.min_batch_size > 1 and 
+            len(self.waiting_queue) < self.min_batch_size and 
+            not self.chunked_req):
+            
+            # If we haven't exceeded the wait time, return None to wait for more requests
+            if (self.max_batch_wait_ms > 0 and 
+                (current_time - self.last_batch_time) * 1000 < self.max_batch_wait_ms):
+                return None
+            
+            # If we've exceeded wait time but have some requests, log it
+            if len(self.waiting_queue) > 0:
+                wait_time_ms = (current_time - self.last_batch_time) * 1000
+                logger.info(
+                    f"Batch dispatch due to timeout: {wait_time_ms:.1f}ms elapsed "
+                    f"(max wait: {self.max_batch_wait_ms}ms). "
+                    f"Processing {len(self.waiting_queue)} requests "
+                    f"(minimum batch size: {self.min_batch_size})"
+                )
+        elif len(self.waiting_queue) > 0:
+            # Log when we're dispatching for other reasons (e.g. max batch size reached)
+            logger.info(
+                f"Batch dispatch due to other conditions. "
+                f"Processing {len(self.waiting_queue)} requests "
+                f"(minimum batch size: {self.min_batch_size})"
+            )
+
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked request has just been released.
@@ -1472,6 +1505,10 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
+
+        # Update last batch time when we actually process a batch
+        if len(can_run_list) > 0:
+            self.last_batch_time = current_time
 
         return new_batch
 
