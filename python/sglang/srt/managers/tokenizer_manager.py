@@ -533,7 +533,6 @@ class TokenizerManager:
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-
         input_token_num = len(input_ids) if input_ids is not None else 0
         # Check if input alone exceeds context length
         if input_token_num >= self.context_len:
@@ -557,6 +556,17 @@ class TokenizerManager:
                 f"of tokens in the input messages or the completion to fit within the limit."
             )
             raise ValueError(error_msg)
+
+    def _get_tokenizer(self):
+        """Get or initialize tokenizer in the current process."""
+        if self._tokenizer is None:
+            self._tokenizer = get_tokenizer(
+                self._tokenizer_path,
+                tokenizer_mode=self._tokenizer_mode,
+                trust_remote_code=self._trust_remote_code,
+                revision=self._revision,
+            )
+        return self._tokenizer
 
     def _create_tokenized_object(
         self,
