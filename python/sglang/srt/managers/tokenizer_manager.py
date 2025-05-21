@@ -120,6 +120,9 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+import torch
+import torch.profiler
+from torch.profiler import profile, record_function, ProfilerActivity
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -191,6 +194,12 @@ class TokenizerManager:
         self.tokenizer_thread_pool = ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_TOKENIZER_WORKERS", os.cpu_count()))
         )
+
+        # Add profiler
+        self.torch_profiler = None
+        self.torch_profiler_output_dir = None
+        self.profiler_activities = None
+        self.profiler_id = None
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -450,6 +459,16 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        if self.torch_profiler is not None:
+            with record_function("tokenize_one_request"):
+                return await self._tokenize_one_request_impl(obj)
+        return await self._tokenize_one_request_impl(obj)
+
+    async def _tokenize_one_request_impl(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ):
+        """Implementation of tokenize one request."""
         # Track tokenization rate
         with self.tokenization_rate_lock:
             self.tokenization_counter += 1
@@ -605,6 +624,15 @@ class TokenizerManager:
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
+        if self.torch_profiler is not None:
+            with record_function("batch_tokenize_and_process"):
+                return await self._batch_tokenize_and_process_impl(batch_size, obj)
+        return await self._batch_tokenize_and_process_impl(batch_size, obj)
+
+    async def _batch_tokenize_and_process_impl(
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        """Implementation of batch tokenize and process."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
         # Track tokenization rate for batch processing
@@ -810,7 +838,44 @@ class TokenizerManager:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
     ):
-        self.auto_create_handle_loop()
+        """Start profiling."""
+        if self.profiler_activities is not None:
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already in progress. Call /stop_profile first.",
+            )
+
+        if output_dir is None:
+            output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+        if activities is None:
+            activities = ["CPU", "GPU"]
+
+        self.torch_profiler_output_dir = output_dir
+        self.profiler_activities = activities
+        self.profiler_id = str(time.time())
+        logger.info(
+            "TokenizerManager profiling starts. Traces will be saved to: %s (with id %s)",
+            self.torch_profiler_output_dir,
+            self.profiler_id,
+        )
+
+        activity_map = {
+            "CPU": torch.profiler.ProfilerActivity.CPU,
+            "GPU": torch.profiler.ProfilerActivity.CUDA,
+        }
+        torchprof_activities = [
+            activity_map[a] for a in activities if a in activity_map
+        ]
+
+        if torchprof_activities:
+            self.torch_profiler = torch.profiler.profile(
+                activities=torchprof_activities,
+                with_stack=with_stack if with_stack is not None else True,
+                record_shapes=record_shapes if record_shapes is not None else False,
+            )
+            self.torch_profiler.start()
+
+        # Also start scheduler profiling
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -818,14 +883,42 @@ class TokenizerManager:
             activities=activities,
             with_stack=with_stack,
             record_shapes=record_shapes,
-            profile_id=str(time.time()),
+            profile_id=self.profiler_id,
         )
         return await self._execute_profile(req)
 
     async def stop_profile(self):
-        self.auto_create_handle_loop()
+        """Stop profiling."""
+        if self.profiler_activities is None:
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is not in progress. Call /start_profile first.",
+            )
+
+        logger.info("TokenizerManager stop profiling...")
+        if self.torch_profiler is not None:
+            self.torch_profiler.stop()
+            self.torch_profiler.export_chrome_trace(
+                os.path.join(
+                    self.torch_profiler_output_dir,
+                    f"tokenizer_manager_{self.profiler_id}.trace.json.gz",
+                )
+            )
+
+        # Also stop scheduler profiling
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
-        return await self._execute_profile(req)
+        result = await self._execute_profile(req)
+
+        self.torch_profiler = None
+        self.torch_profiler_output_dir = None
+        self.profiler_activities = None
+        self.profiler_id = None
+
+        logger.info(
+            "TokenizerManager profiling done. Traces are saved to: %s",
+            self.torch_profiler_output_dir,
+        )
+        return result
 
     async def _execute_profile(self, req: ProfileReq):
         result = (await self.profile_communicator(req))[0]
