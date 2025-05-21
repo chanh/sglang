@@ -46,6 +46,8 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -184,6 +186,11 @@ class TokenizerManager:
         self.tokenization_rate_interval = 1  # Print rate every 1 second
         self.last_tokenization_rate_print = time.time()
         self.tokenization_rate_lock = threading.Lock()
+
+        # Add thread pool for parallel tokenization
+        self.tokenizer_thread_pool = ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_TOKENIZER_WORKERS", os.cpu_count()))
+        )
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -620,15 +627,21 @@ class TokenizerManager:
         encoded = self.tokenizer(texts)
         input_ids_list = encoded["input_ids"]
 
-        # Process all requests
-        tokenized_objs = []
-        for i, req in enumerate(requests):
+        # Process all requests in parallel using thread pool
+        def process_request(i):
+            req = requests[i]
             self._validate_token_len(obj[i], input_ids_list[i])
-            tokenized_objs.append(
-                self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None
-                )
+            return self._create_tokenized_object(
+                req, req.text, input_ids_list[i], None, None
             )
+
+        # Use thread pool to parallelize request processing
+        futures = [
+            self.tokenizer_thread_pool.submit(process_request, i)
+            for i in range(batch_size)
+        ]
+        tokenized_objs = [f.result() for f in futures]
+
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -741,45 +754,17 @@ class TokenizerManager:
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
-                # Sequential tokenization and processing
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
-                    rids.append(tmp_obj.rid)
-        else:
-            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
-            if batch_size > 128:
-                logger.warning(
-                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
-                    "The performance might be better if you just duplicate the requests n times or use "
-                    "many threads to send them one by one with parallel sampling (n > 1)."
+                # Parallel tokenization for individual requests
+                objs = [obj[i] for i in range(batch_size)]
+                futures = [
+                    self.tokenizer_thread_pool.submit(self._tokenize_one_request, tmp_obj)
+                    for tmp_obj in objs
+                ]
+                tokenized_objs = await asyncio.gather(
+                    *(asyncio.wrap_future(f) for f in futures)
                 )
 
-            # Tokenize all requests
-            objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
-            )
-
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, request).__anext__()
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
-                    tmp_obj = copy.copy(objs[i])
-                    tokenized_obj = copy.copy(tokenized_objs[i])
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                for i, (tmp_obj, tokenized_obj) in enumerate(zip(objs, tokenized_objs)):
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
@@ -1446,6 +1431,11 @@ class TokenizerManager:
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    def __del__(self):
+        """Cleanup thread pool on deletion."""
+        if hasattr(self, 'tokenizer_thread_pool'):
+            self.tokenizer_thread_pool.shutdown(wait=True)
 
 
 async def print_exception_wrapper(func):
