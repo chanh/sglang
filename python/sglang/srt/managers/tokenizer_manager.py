@@ -48,7 +48,8 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
+import multiprocessing as mp
+from queue import Empty
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -165,6 +166,64 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
+def _tokenize_text_in_process(text: str, tokenizer_path: str, tokenizer_mode: str, trust_remote_code: bool, revision: str) -> List[int]:
+    """Tokenize text in a worker process."""
+    # Each worker process needs its own tokenizer
+    tokenizer = get_tokenizer(
+        tokenizer_path,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+    )
+    return tokenizer.encode(text)
+
+
+def _tokenize_batch_in_process(texts: List[str], tokenizer_path: str, tokenizer_mode: str, trust_remote_code: bool, revision: str) -> List[List[int]]:
+    """Tokenize a batch of texts in a worker process."""
+    # Each worker process needs its own tokenizer
+    tokenizer = get_tokenizer(
+        tokenizer_path,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+    )
+    # Use batch_encode for better performance
+    encoded = tokenizer(texts)
+    return encoded["input_ids"]
+
+
+def _tokenizer_worker(
+    input_queue: mp.Queue,
+    output_queue: mp.Queue,
+    tokenizer_path: str,
+    tokenizer_mode: str,
+    trust_remote_code: bool,
+    revision: str,
+):
+    """Long-running worker process that continuously processes tokenization requests."""
+    # Initialize tokenizer once when worker starts
+    tokenizer = get_tokenizer(
+        tokenizer_path,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+    )
+    
+    while True:
+        try:
+            # Get batch of texts to process
+            batch_id, texts = input_queue.get()
+            if texts is None:  # Poison pill to stop worker
+                break
+                
+            # Process the batch
+            encoded = tokenizer(texts)
+            output_queue.put((batch_id, encoded["input_ids"]))
+        except Exception as e:
+            logger.error(f"Error in tokenizer worker: {e}")
+            output_queue.put((batch_id, e))
+
+
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -191,11 +250,34 @@ class TokenizerManager:
         self.last_tokenization_rate_print = time.time()
         self.tokenization_rate_lock = threading.Lock()
 
-        # Add process pool for parallel tokenization
-        self.tokenizer_process_pool = ProcessPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_TOKENIZER_WORKERS", os.cpu_count())),
-            mp_context=multiprocessing.get_context('spawn')  # Use spawn for better compatibility
-        )
+        # Initialize worker pool for tokenization
+        self.num_workers = int(os.environ.get("SGLANG_TOKENIZER_WORKERS", 16))
+        self.input_queue = mp.Queue()
+        self.output_queue = mp.Queue()
+        self.workers = []
+        self.batch_counter = 0
+        self.batch_futures = {}
+        self.batch_futures_lock = threading.Lock()
+        
+        # Start worker processes
+        for _ in range(self.num_workers):
+            p = mp.Process(
+                target=_tokenizer_worker,
+                args=(
+                    self.input_queue,
+                    self.output_queue,
+                    server_args.tokenizer_path,
+                    server_args.tokenizer_mode,
+                    server_args.trust_remote_code,
+                    server_args.revision,
+                ),
+            )
+            p.start()
+            self.workers.append(p)
+            
+        # Start output processing thread
+        self.output_thread = threading.Thread(target=self._process_outputs, daemon=True)
+        self.output_thread.start()
 
         # Store tokenizer in a way that can be pickled for process pool
         self._tokenizer_path = server_args.tokenizer_path
@@ -427,6 +509,21 @@ class TokenizerManager:
                 self.server_args.disaggregation_bootstrap_port
             )
 
+    def _process_outputs(self):
+        """Process outputs from worker processes and set futures."""
+        while True:
+            try:
+                batch_id, result = self.output_queue.get()
+                with self.batch_futures_lock:
+                    if batch_id in self.batch_futures:
+                        future = self.batch_futures.pop(batch_id)
+                        if isinstance(result, Exception):
+                            future.set_exception(result)
+                        else:
+                            future.set_result(result)
+            except Exception as e:
+                logger.error(f"Error processing tokenizer output: {e}")
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -639,14 +736,16 @@ class TokenizerManager:
 
         return tokenized_obj
 
-    async def _batch_tokenize_and_process(
-        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
-        """Handle batch tokenization for text inputs only."""
-        if self.torch_profiler is not None:
-            with record_function("batch_tokenize_and_process"):
-                return await self._batch_tokenize_and_process_impl(batch_size, obj)
-        return await self._batch_tokenize_and_process_impl(batch_size, obj)
+    def _tokenize_text(self, text: str) -> List[int]:
+        """Tokenize text in a worker process."""
+        # Each worker process needs its own tokenizer
+        tokenizer = get_tokenizer(
+            self._tokenizer_path,
+            tokenizer_mode=self._tokenizer_mode,
+            trust_remote_code=self._trust_remote_code,
+            revision=self._revision,
+        )
+        return tokenizer.encode(text)
 
     async def _batch_tokenize_and_process_impl(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -670,32 +769,31 @@ class TokenizerManager:
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
 
-        # Batch tokenize all texts in the main process since we need the tokenizer
-        tokenizer = self._get_tokenizer()
-        encoded = tokenizer(texts)
-        input_ids_list = encoded["input_ids"]
+        # Create future for this batch
+        future = asyncio.Future()
+        with self.batch_futures_lock:
+            batch_id = self.batch_counter
+            self.batch_counter += 1
+            self.batch_futures[batch_id] = future
 
-        # Process all requests in parallel using process pool
-        def process_request(i):
-            # Each worker process needs its own tokenizer
-            tokenizer = get_tokenizer(
-                self._tokenizer_path,
-                tokenizer_mode=self._tokenizer_mode,
-                trust_remote_code=self._trust_remote_code,
-                revision=self._revision,
-            )
-            req = requests[i]
-            self._validate_token_len(obj[i], input_ids_list[i])
-            return self._create_tokenized_object(
-                req, req.text, input_ids_list[i], None, None
-            )
+        # Submit batch to worker pool
+        self.input_queue.put((batch_id, texts))
 
-        # Use process pool to parallelize request processing
-        futures = [
-            self.tokenizer_process_pool.submit(process_request, i)
-            for i in range(batch_size)
-        ]
-        tokenized_objs = [f.result() for f in futures]
+        # Wait for results
+        try:
+            input_ids_list = await future
+        except Exception as e:
+            logger.error(f"Error in batch tokenization: {e}")
+            raise
+
+        # Process the rest in the main process
+        tokenized_objs = []
+        for i, (req, input_ids) in enumerate(zip(requests, input_ids_list)):
+            self._validate_token_len(req, input_ids)
+            tokenized_obj = self._create_tokenized_object(
+                req, req.text, input_ids, None, None
+            )
+            tokenized_objs.append(tokenized_obj)
 
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
@@ -801,7 +899,7 @@ class TokenizerManager:
                 # Validate batch tokenization constraints
                 self._validate_batch_tokenization_constraints(batch_size, obj)
 
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                tokenized_objs = await self._batch_tokenize_and_process_impl(batch_size, obj)
 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
@@ -812,8 +910,7 @@ class TokenizerManager:
                 # Parallel tokenization for individual requests
                 objs = [obj[i] for i in range(batch_size)]
                 futures = [
-                    self.tokenizer_process_pool.submit(self._tokenize_one_request, tmp_obj)
-                    for tmp_obj in objs
+                    self.input_queue.put((None, [req.text])) for req in objs
                 ]
                 tokenized_objs = await asyncio.gather(
                     *(asyncio.wrap_future(f) for f in futures)
@@ -1553,9 +1650,14 @@ class TokenizerManager:
                 self.model_update_result.set_result(self.model_update_tmp)
 
     def __del__(self):
-        """Cleanup process pool on deletion."""
-        if hasattr(self, 'tokenizer_process_pool'):
-            self.tokenizer_process_pool.shutdown(wait=True)
+        """Cleanup worker processes on deletion."""
+        # Send poison pill to all workers
+        for _ in self.workers:
+            self.input_queue.put((None, None))
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join()
 
 
 async def print_exception_wrapper(func):
