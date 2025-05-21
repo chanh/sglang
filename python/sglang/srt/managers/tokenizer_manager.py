@@ -178,6 +178,13 @@ class TokenizerManager:
             else None
         )
 
+        # Add tokenization rate tracking
+        self.tokenization_counter = 0
+        self.tokenization_start_time = time.time()
+        self.tokenization_rate_interval = 1  # Print rate every 1 second
+        self.last_tokenization_rate_print = time.time()
+        self.tokenization_rate_lock = threading.Lock()
+
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
@@ -436,6 +443,18 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        # Track tokenization rate
+        with self.tokenization_rate_lock:
+            self.tokenization_counter += 1
+            current_time = time.time()
+            if current_time - self.last_tokenization_rate_print >= self.tokenization_rate_interval:
+                elapsed = current_time - self.tokenization_start_time
+                rate = self.tokenization_counter / elapsed
+                logger.info(f"Tokenization rate: {rate:.2f} requests/second")
+                self.tokenization_counter = 0
+                self.tokenization_start_time = current_time
+                self.last_tokenization_rate_print = current_time
+
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -580,6 +599,18 @@ class TokenizerManager:
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
+
+        # Track tokenization rate for batch processing
+        with self.tokenization_rate_lock:
+            self.tokenization_counter += batch_size
+            current_time = time.time()
+            if current_time - self.last_tokenization_rate_print >= self.tokenization_rate_interval:
+                elapsed = current_time - self.tokenization_start_time
+                rate = self.tokenization_counter / elapsed
+                logger.info(f"Tokenization rate: {rate:.2f} requests/second")
+                self.tokenization_counter = 0
+                self.tokenization_start_time = current_time
+                self.last_tokenization_rate_print = current_time
 
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
