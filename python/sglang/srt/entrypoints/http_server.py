@@ -757,18 +757,18 @@ def launch_server(
         add_prometheus_middleware(app)
         enable_func_timer()
 
-    # Send a warmup request - we will create the thread launch it
-    # in the lifespan after all other warmups have fired.
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        args=(
-            server_args,
-            pipe_finish_writer,
-            _global_state.tokenizer_manager.image_token_id,
-            launch_callback,
-        ),
-    )
-    app.warmup_thread = warmup_thread
+    # # Send a warmup request - we will create the thread launch it
+    # # in the lifespan after all other warmups have fired.
+    # warmup_thread = threading.Thread(
+    #     target=_wait_and_warmup,
+    #     args=(
+    #         server_args,
+    #         pipe_finish_writer,
+    #         _global_state.tokenizer_manager.image_token_id,
+    #         launch_callback,
+    #     ),
+    # )
+    # app.warmup_thread = warmup_thread
 
     try:
         # Update logging configs
@@ -784,7 +784,8 @@ def launch_server(
             loop="uvloop",
         )
     finally:
-        warmup_thread.join()
+        # warmup_thread.join()
+        pass
 
 
 def _wait_and_warmup(
