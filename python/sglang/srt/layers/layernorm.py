@@ -64,7 +64,9 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # print(f"[DEBUG] RMSNorm.forward_cuda: x.shape={x.shape}, x.dtype={x.dtype}")
         if residual is not None:
+            # print(f"[DEBUG] RMSNorm.forward_cuda: residual.shape={residual.shape}, residual.dtype={residual.dtype}")
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)

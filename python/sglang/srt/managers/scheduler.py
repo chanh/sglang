@@ -666,6 +666,7 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                logger.info(f"[Scheduler] Running batch_id={batch.batch_id}")
                 batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
@@ -686,6 +687,7 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
+                logger.info(f"[Scheduler] Processing batch_id={tmp_batch.batch_id}")
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
@@ -801,39 +803,38 @@ class Scheduler(
                 self.new_token_ratio = self.init_new_token_ratio
 
     def recv_requests(self) -> List[Req]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        if self.pp_rank == 0:
-            if self.attn_tp_rank == 0:
-                recv_reqs = []
-
-                while True:
-                    try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
-            else:
-                recv_reqs = None
-        else:
-            if self.attn_tp_rank == 0:
-                dp_offset = self.attn_dp_rank * self.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.pp_rank - 1) * self.tp_size + dp_offset,
-                    self.pp_rank * self.tp_size + dp_offset,
-                )
-            else:
-                recv_reqs = None
-
+        """Pull from ZMQ until at least min_batch_size requests are received or timeout expires."""
+        min_batch_size = getattr(self.server_args, 'min_batch_size', 0)
+        max_timeout = getattr(self.server_args, 'max_batch_wait_timeout', 0.0)
+        start_time = time.time()
+        recv_reqs = []
+        while True:
+            # Drain tokenizer requests
+            while True:
+                try:
+                    req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_reqs.append(req)
+                except zmq.ZMQError:
+                    break
+            # Drain RPC requests
+            while True:
+                try:
+                    rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                    recv_reqs.append(rpc)
+                except zmq.ZMQError:
+                    break
+            if min_batch_size > 0 and len(recv_reqs) < min_batch_size:
+                elapsed = time.time() - start_time
+                # print(f"[recv_requests] Waiting for batch to fill: {len(recv_reqs)}/{min_batch_size} requests, elapsed={elapsed:.2f}s, max_timeout={max_timeout}")
+                if max_timeout > 0.0 and elapsed >= max_timeout:
+                    print(f"[recv_requests] Timeout reached: {len(recv_reqs)}/{min_batch_size} requests, elapsed={elapsed:.2f}s, max_timeout={max_timeout}")
+                    break
+                time.sleep(0.01)
+                continue
+            if min_batch_size > 0:
+                print(f"[recv_requests] Batch constraints satisfied: {len(recv_reqs)}/{min_batch_size} requests, elapsed={time.time() - start_time:.2f}s, max_timeout={max_timeout}")
+            break
+        # (rest of the original logic for DP attention, etc, unchanged)
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
                 work_reqs = [
@@ -1323,6 +1324,7 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
+        # print(f"[SGLANG][get_num_allocatable_reqs] max_micro_batch_size={global_server_args_dict['max_micro_batch_size']}, running_bs={running_bs}")
         res = global_server_args_dict["max_micro_batch_size"] - running_bs
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
@@ -1340,24 +1342,19 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked request has just been released.
-        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
         if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req:
             self.running_batch.batch_is_full = True
             return None
 
         if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
             self.tree_cache.writing_check()
             self.tree_cache.loading_check()
 
-        # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
-        # Prefill policy
+        # Remove min_batch_size and max_batch_wait_timeout waiting logic from here
+        # Only form a batch from the current waiting_queue
+
         adder = PrefillAdder(
             self.tree_cache,
             self.token_to_kv_pool_allocator,
@@ -1375,7 +1372,6 @@ class Scheduler(
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
-        # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
                 self.lora_paths
@@ -1405,7 +1401,6 @@ class Scheduler(
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (not self.running_batch.is_empty())
@@ -1413,13 +1408,11 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
-        # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
 
         if self.enable_metrics:
-            # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
 
@@ -1437,11 +1430,9 @@ class Scheduler(
         if self.chunked_req:
             self.chunked_req.is_chunked += 1
 
-        # Print stats
         if self.attn_tp_rank == 0:
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
-        # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -1455,13 +1446,11 @@ class Scheduler(
         )
         new_batch.prepare_for_extend()
 
-        # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -2053,6 +2042,7 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
+        # print(f"[DEBUG][Scheduler] Starting SGLang profiler...")
         if recv_req.type == ProfileReqType.START_PROFILE:
             return self.start_profile(
                 recv_req.output_dir,
@@ -2063,6 +2053,7 @@ class Scheduler(
                 recv_req.profile_id,
             )
         else:
+            # print(f"[DEBUG][Scheduler] Stopping SGLang profiler...")
             return self.stop_profile()
 
     def start_profile(

@@ -437,6 +437,8 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
         # Tokenize
+        import time
+        start_time = time.time()
         input_embeds = None
         input_text = obj.text
         if obj.input_embeds is not None:
@@ -458,6 +460,8 @@ class TokenizerManager:
                     "the engine with skip_tokenizer_init=False."
                 )
             input_ids = self.tokenizer.encode(input_text)
+        end_time = time.time()
+        # print(f"[Tokenization] Single request tokenization took {end_time - start_time:.6f} seconds.")
 
         image_inputs: Optional[Dict] = None
         if obj.contains_mm_input():
@@ -579,6 +583,7 @@ class TokenizerManager:
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
+        import time
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
         # Collect requests and texts
@@ -586,7 +591,10 @@ class TokenizerManager:
         texts = [req.text for req in requests]
 
         # Batch tokenize all texts
+        start_time = time.time()
         encoded = self.tokenizer(texts)
+        end_time = time.time()
+        print(f"[Tokenization] Batch tokenization of {batch_size} requests took {end_time - start_time:.6f} seconds.")
         input_ids_list = encoded["input_ids"]
 
         # Process all requests
@@ -625,6 +633,7 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        # print(f"[DEBUG][TokenizerManager] Sending request to scheduler: rid={getattr(obj, 'rid', None)}")
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
@@ -694,6 +703,7 @@ class TokenizerManager:
         created_time: Optional[float] = None,
     ):
         batch_size = obj.batch_size
+        # print(f"[DEBUG][TokenizerManager] Handling batch request: batch_size={batch_size}")
 
         generators = []
         rids = []
@@ -706,17 +716,26 @@ class TokenizerManager:
 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
+                    # print(f"[DEBUG][TokenizerManager] Preparing to send request: rid={getattr(tmp_obj, 'rid', None)}")
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
+                tokenized_objs = []
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    tokenized_objs.append((tmp_obj, tokenized_obj))
+
+                # Send all requests to the scheduler first
+                for tmp_obj, tokenized_obj in tokenized_objs:
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
+
+                # Now, start waiting for responses
+                for tmp_obj, _ in tokenized_objs:
+                    generators.append(self._wait_one_response(tmp_obj, request))
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:

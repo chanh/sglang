@@ -317,6 +317,7 @@ class Engine(EngineBase):
         return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
     def start_profile(self):
+        print(f"[DEBUG][Engine] Starting SGLang profiler...")
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.start_profile())
 

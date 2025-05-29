@@ -75,6 +75,9 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     page_size: int = 1
+    # --- New batch scheduling options ---
+    max_batch_wait_timeout: float = 0.0  # Maximum seconds to wait before scheduling a batch (0 disables)
+    min_batch_size: int = 0  # Minimum number of requests before scheduling a batch (0 disables)
 
     # Other runtime options
     tp_size: int = 1
@@ -692,6 +695,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--min-batch-token-size",
+            type=int,
+            default=ServerArgs.min_batch_token_size,
+            help="Minimum total token count before scheduling a batch (0 disables).",
+        )
+        parser.add_argument(
+            "--max-batch-wait-timeout",
+            type=float,
+            default=ServerArgs.max_batch_wait_timeout,
+            help="Maximum seconds to wait before scheduling a batch (0 disables).",
         )
 
         # Other runtime options

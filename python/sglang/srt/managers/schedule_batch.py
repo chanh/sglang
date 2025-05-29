@@ -648,6 +648,7 @@ class Req:
                 self.last_node = self.last_node.parent
 
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        # print(f"[DEBUG][Req] init_next_round_input: {self.extend_input_len}, cached_tokens: {len(self.prefix_indices)}")
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
@@ -787,93 +788,62 @@ bid = 0
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
-    # Request, memory pool, and cache
+    # All required and defaulted fields first
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
-
-    # Batch configs
     model_config: ModelConfig = None
     forward_mode: ForwardMode = None
     enable_overlap: bool = False
-    # Tell whether the current running batch is full so that we can skip
-    # the check of whether to prefill new requests.
-    # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
-
-    # Events
     launch_done: Optional[threading.Event] = None
-
-    # For chunked prefill in PP
     chunked_req: Optional[Req] = None
-
-    # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
-
-    # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
-    # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
-
-    # For multimodal inputs
     multimodal_inputs: Optional[List] = None
-
-    # The sum of all sequence lengths
     seq_lens_sum: int = None
-
-    # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
-
-    # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
-
-    # For logits and logprob post processing
     temp_scaled_logprobs: bool = False
     top_p_normalized_logprobs: bool = False
-
-    # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
-    # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
-
-    # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
     encoder_lens: Optional[torch.Tensor] = None
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
-
-    # Stream
     has_stream: bool = False
-
-    # Has grammar
     has_grammar: bool = False
-
-    # Device
     device: str = "cuda"
-
-    # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
-
-    # Enable custom logit processor
     enable_custom_logit_processor: bool = False
-
-    # Whether to return hidden states
     return_hidden_states: bool = False
+    # Now the fields with default_factory or class variables
+    batch_id: int = dataclasses.field(default_factory=lambda: ScheduleBatch._next_batch_id())
+    _batch_id_counter: int = 0  # class variable
+
+    @classmethod
+    def _next_batch_id(cls):
+        if not hasattr(cls, '_batch_id_counter'):
+            cls._batch_id_counter = 0
+        cls._batch_id_counter += 1
+        return cls._batch_id_counter
 
     @classmethod
     def init_new(
@@ -889,8 +859,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
-
-        return cls(
+        batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -906,6 +875,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             chunked_req=chunked_req,
         )
+        logger.info(f"[ScheduleBatch] Created batch_id={batch.batch_id} with {len(reqs)} reqs")
+        return batch
 
     def batch_size(self):
         return len(self.reqs)

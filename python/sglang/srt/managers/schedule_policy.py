@@ -21,6 +21,7 @@ from enum import Enum, auto
 from typing import Dict, List, Optional, Set, Union
 
 import torch
+import logging
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -324,11 +325,13 @@ class PrefillAdder:
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            print(f"[PrefillAdder] NO_TOKEN: rem_total_tokens={self.rem_total_tokens}, cur_rem_tokens={self.cur_rem_tokens}")
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0 or (
             self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
         ):
+            print(f"[PrefillAdder] OTHER: rem_input_tokens={self.rem_input_tokens}, rem_chunk_tokens={self.rem_chunk_tokens}")
             return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
@@ -445,6 +448,7 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, enable_hierarchical_cache: bool = False
     ):
+        # print(f"[DEBUG][PrefillAdder] Attempting to add req: extend_input_len={req.extend_input_len}, max_new_tokens={req.sampling_params.max_new_tokens}, total_tokens={req.extend_input_len + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)}, rem_total_tokens={self.rem_total_tokens}, rem_input_tokens={self.rem_input_tokens}, rem_chunk_tokens={self.rem_chunk_tokens}")
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
@@ -458,13 +462,16 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            print(f"[PrefillAdder] NO_TOKEN: total_tokens={total_tokens} >= rem_total_tokens={self.rem_total_tokens}")
             return AddReqResult.NO_TOKEN
 
         if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+            print(f"[PrefillAdder] BATCH FULL: input_tokens={input_tokens} > rem_input_tokens={self.rem_input_tokens}, can_run_list={len(self.can_run_list)}")
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             if total_tokens > self.rem_total_tokens:
+                print(f"[PrefillAdder] NO_TOKEN (inside lock): total_tokens={total_tokens} > rem_total_tokens={self.rem_total_tokens}")
                 return AddReqResult.NO_TOKEN
 
             if (

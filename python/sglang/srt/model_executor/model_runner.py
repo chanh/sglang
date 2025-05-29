@@ -1098,6 +1098,17 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        # Print the number of tokens being processed in the batch
+        num_tokens = 0
+        if hasattr(forward_batch, 'input_ids') and forward_batch.input_ids is not None:
+            if isinstance(forward_batch.input_ids, list):
+                num_tokens = sum(len(ids) for ids in forward_batch.input_ids)
+            elif hasattr(forward_batch.input_ids, 'shape'):
+                num_tokens = forward_batch.input_ids.numel()
+        print(f"[SGLANG][forward_extend] Processing batch with {num_tokens} tokens.")
+
+        import time
+        start_time = time.time() 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
@@ -1108,12 +1119,17 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
-        return self.model.forward(
+        result = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        import torch
+        # torch.cuda.synchronize()
+        elapsed = time.time() - start_time
+        print(f"[SGLANG][forward_extend] Kernel execution time: {elapsed:.3f} seconds.")
+        return result
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
