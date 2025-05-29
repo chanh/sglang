@@ -181,6 +181,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        self.enable_multi_item_scoring = model_runner.server_args.enable_multi_item_scoring
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
@@ -236,7 +238,7 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+            if self.is_multimodal or self.enable_multi_item_scoring:
                 use_ragged = False
                 extend_no_prefix = False
             else:

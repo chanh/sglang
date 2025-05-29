@@ -20,6 +20,9 @@ class GlobalConfig:
         # Default backend of the language
         self.default_backend = None
 
+        # Special token IDs
+        self.delimiter_token_id = int(os.environ.get("SGLANG_DELIMITER_TOKEN_ID", -1))  # -1 means not set
+
         # Runtime constants: New generation token ratio estimation
         self.default_init_new_token_ratio = float(
             os.environ.get("SGLANG_INIT_NEW_TOKEN_RATIO", 0.7)
